@@ -1,0 +1,345 @@
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <UniversalTelegramBot.h>
+#include <TinyGPS++.h>
+#include <HardwareSerial.h>
+#include <Wire.h>
+#include <Adafruit_Sensor.h>
+#include <Adafruit_HMC5883_U.h>
+#include <math.h>
+
+// ===== WiFi + Telegram =====
+const char* ssid = "YOUR_WIFI_NAME";
+const char* password = "YOUR_WIFI_PASS";
+String BOTtoken = "YOUR_BOT_TOKEN";   
+String chat_id = "YOUR_CHAT_ID";
+
+WiFiClientSecure client;
+UniversalTelegramBot bot(BOTtoken, client);
+
+// ===== GPS =====
+TinyGPSPlus gps;
+HardwareSerial gpsSerial(1);  // RX=16, TX=17
+
+// ===== Compass =====
+Adafruit_HMC5883_Unified compass = Adafruit_HMC5883_Unified(12345);
+
+// ===== Pins =====
+#define LED_PIN            2
+#define RIGHT_MOTOR_FWD    4
+#define RIGHT_MOTOR_BWD    5
+#define TRIG_BIN          12
+#define ECHO_BIN          13
+#define LEFT_SENSOR_ECHO  14
+#define BELT_MOTOR        15
+#define GPS_RX            16  // connect to GPS TX
+#define GPS_TX            17  // connect to GPS RX
+#define RIGHT_SENSOR_TRIG 18
+#define RIGHT_SENSOR_ECHO 19
+#define FRONT_SENSOR_TRIG 25
+#define FRONT_SENSOR_ECHO 26
+#define LEFT_SENSOR_TRIG  27
+#define LEFT_MOTOR_FWD    32
+#define LEFT_MOTOR_BWD    33
+// Compass SDA=21, SCL=22 (default I2C)
+
+// ===== Variables =====
+bool binFull = false;
+bool emergencyStop = false;
+
+// Target location
+double targetLat = 0;
+double targetLon = 0;
+bool targetSet = false;
+
+// Home location
+double homeLat = 0;
+double homeLon = 0;
+bool homeSet = false;
+bool returnHome = false;
+
+// ===== Helper Functions =====
+float getDistance(int trig, int echo) {
+  digitalWrite(trig, LOW); delayMicroseconds(2);
+  digitalWrite(trig, HIGH); delayMicroseconds(10);
+  digitalWrite(trig, LOW);
+  long duration = pulseIn(echo, HIGH, 30000);
+  if (duration == 0) return 999.0;
+  return duration * 0.034 / 2;
+}
+
+bool isBinFull() {
+  float d = getDistance(TRIG_BIN, ECHO_BIN);
+  return (d > 0 && d < 5);
+}
+
+// Motor control
+void stopBoat() {
+  digitalWrite(LEFT_MOTOR_FWD, LOW);
+  digitalWrite(LEFT_MOTOR_BWD, LOW);
+  digitalWrite(RIGHT_MOTOR_FWD, LOW);
+  digitalWrite(RIGHT_MOTOR_BWD, LOW);
+}
+
+void boatForward() {
+  digitalWrite(LEFT_MOTOR_FWD, HIGH);
+  digitalWrite(LEFT_MOTOR_BWD, LOW);
+  digitalWrite(RIGHT_MOTOR_FWD, HIGH);
+  digitalWrite(RIGHT_MOTOR_BWD, LOW);
+}
+
+void turnLeft() {
+  digitalWrite(LEFT_MOTOR_FWD, LOW);
+  digitalWrite(LEFT_MOTOR_BWD, LOW);
+  digitalWrite(RIGHT_MOTOR_FWD, HIGH);
+  digitalWrite(RIGHT_MOTOR_BWD, LOW);
+}
+
+void turnRight() {
+  digitalWrite(LEFT_MOTOR_FWD, HIGH);
+  digitalWrite(LEFT_MOTOR_BWD, LOW);
+  digitalWrite(RIGHT_MOTOR_FWD, LOW);
+  digitalWrite(RIGHT_MOTOR_BWD, LOW);
+}
+
+void beltOn() { digitalWrite(BELT_MOTOR, HIGH); }
+void beltOff() { digitalWrite(BELT_MOTOR, LOW); }
+
+// Obstacle avoidance
+void avoidObstacles() {
+  float frontDist = getDistance(FRONT_SENSOR_TRIG, FRONT_SENSOR_ECHO);
+  float leftDist  = getDistance(LEFT_SENSOR_TRIG, LEFT_SENSOR_ECHO);
+  float rightDist = getDistance(RIGHT_SENSOR_TRIG, RIGHT_SENSOR_ECHO);
+
+  if (frontDist < 30) {
+    if (leftDist > rightDist && leftDist > 30) {
+      turnLeft();
+    } else if (rightDist > 30) {
+      turnRight();
+    } else {
+      stopBoat();
+    }
+  } else {
+    boatForward();
+  }
+}
+
+// Haversine distance (meters)
+double getDistanceMeters(double lat1, double lon1, double lat2, double lon2) {
+  const double R = 6371000.0;
+  double dLat = radians(lat2 - lat1);
+  double dLon = radians(lon2 - lon1);
+  double a = sin(dLat/2) * sin(dLat/2) +
+             cos(radians(lat1)) * cos(radians(lat2)) *
+             sin(dLon/2) * sin(dLon/2);
+  double c = 2 * atan2(sqrt(a), sqrt(1 - a));
+  return R * c;
+}
+
+// ===== Setup =====
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(LED_PIN, OUTPUT);
+  pinMode(LEFT_MOTOR_FWD, OUTPUT);
+  pinMode(LEFT_MOTOR_BWD, OUTPUT);
+  pinMode(RIGHT_MOTOR_FWD, OUTPUT);
+  pinMode(RIGHT_MOTOR_BWD, OUTPUT);
+  pinMode(BELT_MOTOR, OUTPUT);
+
+  pinMode(TRIG_BIN, OUTPUT); pinMode(ECHO_BIN, INPUT);
+  pinMode(FRONT_SENSOR_TRIG, OUTPUT); pinMode(FRONT_SENSOR_ECHO, INPUT);
+  pinMode(LEFT_SENSOR_TRIG, OUTPUT); pinMode(LEFT_SENSOR_ECHO, INPUT);
+  pinMode(RIGHT_SENSOR_TRIG, OUTPUT); pinMode(RIGHT_SENSOR_ECHO, INPUT);
+
+  stopBoat();
+  beltOn();
+
+  gpsSerial.begin(9600, SERIAL_8N1, GPS_RX, GPS_TX);
+  Wire.begin();
+
+  if (!compass.begin()) {
+    Serial.println("❌ Compass not found!");
+    while (1) delay(10);
+  }
+
+  WiFi.begin(ssid, password);
+  client.setInsecure();
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500); Serial.print(".");
+  }
+  Serial.println("✅ WiFi connected.");
+
+  // Save home location at startup
+  Serial.println("⏳ Waiting for GPS fix to save start location...");
+  unsigned long startTime = millis();
+  while (millis() - startTime < 20000) {
+    while (gpsSerial.available()) gps.encode(gpsSerial.read());
+    if (gps.location.isValid()) {
+      homeLat = gps.location.lat();
+      homeLon = gps.location.lng();
+      homeSet = true;
+      bot.sendMessage(chat_id, "🏠 Home location saved:\nLat: " + String(homeLat, 6) +
+                                  "\nLon: " + String(homeLon, 6) +
+                                  "\nGoogle Maps: https://maps.google.com/?q=" +
+                                  String(homeLat, 6) + "," + String(homeLon, 6), "");
+      break;
+    }
+  }
+  if (!homeSet) {
+    bot.sendMessage(chat_id, "⚠ Could not set HOME (no GPS fix at startup)", "");
+  }
+}
+
+// ===== Loop =====
+void loop() {
+  while (gpsSerial.available()) gps.encode(gpsSerial.read());
+
+  if (!emergencyStop) {
+    avoidObstacles();
+  } else {
+    stopBoat();
+  }
+
+  // Bin check
+  if (isBinFull()) {
+    digitalWrite(LED_PIN, HIGH);
+    beltOff();
+    if (!binFull) {
+      binFull = true;
+      bot.sendMessage(chat_id, "⚠ Bin FULL → Returning Home 🏠", "");
+
+      if (homeSet) {
+        targetLat = homeLat;
+        targetLon = homeLon;
+        targetSet = true;
+        returnHome = true;
+      } else {
+        bot.sendMessage(chat_id, "⚠ Home not set, cannot return!", "");
+      }
+    }
+  } else {
+    digitalWrite(LED_PIN, LOW);
+    beltOn();
+    if (binFull) {
+      binFull = false;
+      bot.sendMessage(chat_id, "✅ Bin emptied → Ready to continue", "");
+      returnHome = false;
+    }
+  }
+
+  // Handle Telegram commands
+  int n = bot.getUpdates(bot.last_message_received + 1);
+  for (int i = 0; i < n; i++) {
+    String text = bot.messages[i].text;
+
+    if (text == "/stop") {
+      emergencyStop = true;
+      stopBoat();
+      bot.sendMessage(chat_id, "⛔ STOP!", "");
+    }
+
+    if (text == "/resume") {
+      emergencyStop = false;
+      bot.sendMessage(chat_id, "▶ Resume Auto Navigation", "");
+    }
+
+    if (text == "/location") {
+      if (gps.location.isValid()) {
+        String lat = String(gps.location.lat(), 6);
+        String lon = String(gps.location.lng(), 6);
+        String msg = "📍 Current Boat Location:\n";
+        msg += "Latitude: " + lat + "\nLongitude: " + lon + "\n";
+        msg += "Google Maps: https://maps.google.com/?q=" + lat + "," + lon;
+        bot.sendMessage(chat_id, msg, "");
+      } else {
+        bot.sendMessage(chat_id, "⚠ GPS signal not available.", "");
+      }
+    }
+
+    if (text.startsWith("/set_target")) {
+      int firstSpace = text.indexOf(' ');
+      int secondSpace = text.indexOf(' ', firstSpace + 1);
+      if (firstSpace > 0 && secondSpace > firstSpace) {
+        targetLat = text.substring(firstSpace+1, secondSpace).toDouble();
+        targetLon = text.substring(secondSpace+1).toDouble();
+        targetSet = true;
+        String msg = "🎯 Target location set:\nLatitude: " + String(targetLat, 6) +
+                     "\nLongitude: " + String(targetLon, 6) + "\n";
+        msg += "Google Maps: https://maps.google.com/?q=" + String(targetLat, 6) + "," + String(targetLon, 6);
+        bot.sendMessage(chat_id, msg, "");
+      } else {
+        bot.sendMessage(chat_id, "⚠ Use format: /set_target <lat> <lon>", "");
+      }
+    }
+
+    if (text == "/target") {
+      if (targetSet) {
+        String msg = "🎯 Target Location:\nLat: " + String(targetLat, 6) +
+                     "\nLon: " + String(targetLon, 6) + "\n";
+        msg += "Google Maps: https://maps.google.com/?q=" + String(targetLat, 6) + "," + String(targetLon, 6);
+        bot.sendMessage(chat_id, msg, "");
+      } else {
+        bot.sendMessage(chat_id, "🎯 Target Location: Not set", "");
+      }
+    }
+
+    if (text == "/home") {
+      if (homeSet) {
+        String msg = "🏠 Home Location:\nLat: " + String(homeLat, 6) +
+                     "\nLon: " + String(homeLon, 6) + "\n";
+        msg += "Google Maps: https://maps.google.com/?q=" + String(homeLat, 6) + "," + String(homeLon, 6);
+        bot.sendMessage(chat_id, msg, "");
+      } else {
+        bot.sendMessage(chat_id, "⚠ Home not set yet.", "");
+      }
+    }
+
+    if (text == "/status") {
+      String message = "📊 Boat Status Report\n\n";
+
+      if (emergencyStop) message += "⛔ Mode: STOPPED\n";
+      else message += "🚀 Mode: RUNNING (Auto Navigation)\n";
+
+      if (binFull) message += "🗑 Bin: FULL\n";
+      else message += "🗑 Bin: EMPTY\n";
+
+      if (gps.location.isValid()) {
+        String lat = String(gps.location.lat(), 6);
+        String lon = String(gps.location.lng(), 6);
+        message += "📍 Current Location:\nLat: " + lat + "\nLon: " + lon + "\n";
+        message += "Google Maps: https://maps.google.com/?q=" + lat + "," + lon + "\n";
+      } else {
+        message += "📍 Current Location: GPS not fixed ⚠\n";
+      }
+
+      if (targetSet) {
+        message += "🎯 Target Location:\nLat: " + String(targetLat, 6) +
+                   "\nLon: " + String(targetLon, 6) + "\n";
+        message += "Google Maps: https://maps.google.com/?q=" + String(targetLat, 6) + "," + String(targetLon, 6) + "\n";
+
+        if (gps.location.isValid()) {
+          double dist = getDistanceMeters(gps.location.lat(), gps.location.lng(), targetLat, targetLon);
+          message += "📏 Distance to Target: " + String(dist, 1) + " meters\n";
+
+          if (dist < 2.0) {
+            stopBoat();
+            emergencyStop = true;
+
+            if (returnHome) {
+              bot.sendMessage(chat_id, "🏠 Home Reached! Bin is FULL. Boat stopped.", "");
+              returnHome = false;
+            } else {
+              bot.sendMessage(chat_id, "🎯 Target Reached! Boat stopped.", "");
+            }
+            targetSet = false;
+          }
+        }
+      } else {
+        message += "🎯 Target Location: Not set\n";
+      }
+
+      bot.sendMessage(chat_id, message, "");
+    }
+  }
+}
